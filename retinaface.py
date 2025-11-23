@@ -66,7 +66,9 @@ class RetinaFaceDetector():
         options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
         options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         options.log_severity_level = 3
-        providersList = onnxruntime.capi._pybind_state.get_available_providers()
+        providersList = [p for p in onnxruntime.capi._pybind_state.get_available_providers() if "OpenVINOExecutionProvider" not in str(p)]
+        if len(providersList) == 0:
+            providersList = ["CPUExecutionProvider"]
         self.session = onnxruntime.InferenceSession(model_path, sess_options=options, providers=providersList)
         self.res_w, self.res_h = res
         with open(json_path, "r") as prior_file:

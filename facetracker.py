@@ -34,6 +34,8 @@ parser.add_argument("--discard-after", type=int, help="Set the how long the trac
 parser.add_argument("--max-feature-updates", type=int, help="This is the number of seconds after which feature min/max/medium values will no longer be updated once a face has been detected.", default=900)
 parser.add_argument("--no-3d-adapt", type=int, help="When set to 1, the 3D face model will not be adapted to increase the fit", default=1)
 parser.add_argument("--try-hard", type=int, help="When set to 1, the tracker will try harder to find a face", default=0)
+parser.add_argument("--backend", type=lambda s: s.lower(), help="Select inference backend", default="onnxruntime", choices=["onnxruntime", "openvino"])
+parser.add_argument("--ovdevice", type=lambda s: s.upper(), help="Select OpenVINO device when backend is set to openvino", default="GPU", choices=["CPU", "GPU", "NPU"])
 parser.add_argument("--video-out", help="Set this to the filename of an AVI file to save the tracking visualization as a video", default=None)
 parser.add_argument("--video-scale", type=int, help="This is a resolution scale factor applied to the saved AVI file", default=1, choices=[1,2,3,4])
 parser.add_argument("--video-fps", type=float, help="This sets the frame rate of the output AVI file", default=24)
@@ -129,14 +131,20 @@ import socket
 import struct
 import json
 from input_reader import InputReader, VideoReader, DShowCaptureReader, try_int
-from tracker import Tracker, get_model_base_path
+
+tracker_kwargs = {}
+if args.backend == "openvino":
+    from ovbackend.tracker import Tracker, get_model_base_path
+    tracker_kwargs["ov_device"] = args.ovdevice
+else:
+    from tracker import Tracker, get_model_base_path
 
 if args.benchmark > 0:
     model_base_path = get_model_base_path(args.model_dir)
     im = cv2.imread(os.path.join(model_base_path, "benchmark.bin"), cv2.IMREAD_COLOR)
     results = []
     for model_type in [3, 2, 1, 0, -1, -2, -3]:
-        tracker = Tracker(224, 224, threshold=0.1, max_threads=args.max_threads, max_faces=1, discard_after=0, scan_every=0, silent=True, model_type=model_type, model_dir=args.model_dir, no_gaze=(model_type == -1), detection_threshold=0.1, use_retinaface=0, max_feature_updates=900, static_model=True if args.no_3d_adapt == 1 else False)
+        tracker = Tracker(224, 224, threshold=0.1, max_threads=args.max_threads, max_faces=1, discard_after=0, scan_every=0, silent=True, model_type=model_type, model_dir=args.model_dir, no_gaze=(model_type == -1), detection_threshold=0.1, use_retinaface=0, max_feature_updates=900, static_model=True if args.no_3d_adapt == 1 else False, **tracker_kwargs)
         tracker.detected = 1
         tracker.faces = [(0, 0, 224, 224)]
         total = 0.0
@@ -247,7 +255,7 @@ try:
             first = False
             height, width, channels = frame.shape
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=args.max_feature_updates, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1)
+            tracker = Tracker(width, height, threshold=args.threshold, max_threads=args.max_threads, max_faces=args.faces, discard_after=args.discard_after, scan_every=args.scan_every, silent=False if args.silent == 0 else True, model_type=args.model, model_dir=args.model_dir, no_gaze=False if args.gaze_tracking != 0 and args.model != -1 else True, detection_threshold=args.detection_threshold, use_retinaface=args.scan_retinaface, max_feature_updates=args.max_feature_updates, static_model=True if args.no_3d_adapt == 1 else False, try_hard=args.try_hard == 1, **tracker_kwargs)
             if args.video_out is not None:
                 out = cv2.VideoWriter(args.video_out, cv2.VideoWriter_fourcc('F','F','V','1'), args.video_fps, (width * args.video_scale, height * args.video_scale))
 

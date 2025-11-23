@@ -129,6 +129,15 @@ When distributing it, you should also distribute the `Licenses` folder along wit
 
 The release builds contain a custom build of ONNX Runtime without telemetry.
 
+## Building executables locally
+
+Helper scripts are provided for quickly producing self-contained binaries with [PyInstaller](https://www.pyinstaller.org/):
+
+* `make_exe.sh` / `make_exe.bat` reproduce the original ONNX Runtime based builds.
+* `make_exe_openvino.sh` / `make_exe_openvino.bat` bundle the new OpenVINO backend. These scripts install the OpenVINO Python package inside a temporary virtual environment, collect the required runtime libraries and include the `ov-models` directory automatically. The resulting folder is `dist/facetracker_openvino`.
+
+Run the variant that matches your platform from the repository root. Each script creates its own virtual environment (`venv` or `venv-openvino`), so you can remove those directories once the build is complete.
+
 # Dependencies (Python 3.6 - 3.9)
 
 * ONNX Runtime
@@ -238,4 +247,3 @@ Many thanks to everyone who helped me test things!
 The code and models are distributed under the BSD 2-clause license. 
 
 You can find licenses of third party libraries used for binary builds in the `Licenses` folder.
-

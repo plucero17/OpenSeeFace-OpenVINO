@@ -529,7 +529,9 @@ class Tracker():
 
         # OTR 1.9 and later requires specifying providers
         # explicitly as an argument in InferenceSession()
-        providersList = onnxruntime.capi._pybind_state.get_available_providers()
+        providersList = [p for p in onnxruntime.capi._pybind_state.get_available_providers() if "OpenVINOExecutionProvider" not in str(p)]
+        if len(providersList) == 0:
+            providersList = ["CPUExecutionProvider"]
 
         # Single face instance with multiple threads
         self.session = onnxruntime.InferenceSession(os.path.join(model_base_path, model), sess_options=options, providers=providersList)
