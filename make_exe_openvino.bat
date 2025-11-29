@@ -28,7 +28,6 @@ echo Building facetracker_openvino bundle
 pyinstaller facetracker.py --clean --onedir ^
     --name facetracker_openvino ^
     --add-data ov-models;ov-models ^
-    --add-data models;models ^
     --add-binary "%OV_LIB_DIR%\*.dll";openvino\libs ^
     --add-binary dshowcapture\*.dll;. ^
     --add-binary escapi\*.dll;. ^
