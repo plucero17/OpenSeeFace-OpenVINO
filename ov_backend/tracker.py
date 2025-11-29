@@ -425,7 +425,6 @@ class Tracker():
         if self.device not in ("CPU", "GPU", "NPU"):
             self.device = "GPU"
         self.is_npu = self.device == "NPU"
-        self.inference_precision = ov.Type.f16 if self.is_npu else ov.Type.f32
         self.umat_enabled = hasattr(cv2, "UMat")
         self.request_pool_size = min(max(1, max_threads), 4)
         self.core.set_property(self.device, self._device_properties())
@@ -464,7 +463,6 @@ class Tracker():
                     landmark_path,
                     self.device,
                     (lm_res, lm_res),
-                    precision=self.inference_precision,
                     compile_props=compile_config,
                 )
             except Exception as exc:
@@ -493,7 +491,6 @@ class Tracker():
                     self.device,
                     (32, 32),
                     batch_size=1 if self.single_eye_gaze else 2,
-                    precision=self.inference_precision,
                     compile_props=gaze_compile_config,
                 )
             except Exception as exc:
@@ -522,7 +519,6 @@ class Tracker():
                     detection_path,
                     self.device,
                     (224, 224),
-                    precision=self.inference_precision,
                     compile_props=detection_compile_config,
                 )
             except Exception as exc:
@@ -667,9 +663,7 @@ class Tracker():
         }
 
     def _compile_config(self, device):
-        precision = ov.Type.f16 if device == "NPU" else ov.Type.f32
         config = {
-            ov_hint.inference_precision: precision,
             ov_hint.performance_mode: ov_hint.PerformanceMode.LATENCY,
             ov_hint.num_requests: str(self.request_pool_size),
             props.streams.num: "1",
