@@ -7,7 +7,7 @@ import openvino as ov
 from openvino.properties import hint
 from remedian import remedian
 from .retinaface import RetinaFaceDetector
-from .utils import get_model_base_path, get_ov_model_base_path, temporary_full_cpu_affinity
+from .utils import get_ov_model_base_path, temporary_full_cpu_affinity
 from .processor import build_preprocessed_model
 from .infer_utils import InferRequestPool
 from .math_utils import (
@@ -21,6 +21,12 @@ from .math_utils import (
     logit_arr,
     matrix_to_quaternion,
 )
+
+# Configuration constants
+RETINAFACE_RESOLUTION = (640, 640)
+MIN_CONFIDENCE_THRESHOLD = 0.4
+MAX_PNP_ERROR = 300
+EYE_DEPTH_CONVERSION_FACTOR = 0.385  # Eyeball diameter (12.5mm) / eye corner distance (30-35mm)
 
 class Feature():
     def __init__(self, threshold=0.15, alpha=0.2, hard_factor=0.15, decay=0.001, max_feature_updates=0):
@@ -282,7 +288,7 @@ class FaceInfo():
         return pts_3d
 
     def adjust_3d(self):
-        if self.conf < 0.4 or self.pnp_error > 300:
+        if self.conf < MIN_CONFIDENCE_THRESHOLD or self.pnp_error > MAX_PNP_ERROR:
             return
 
         if self.tracker.model_type != -1 and not self.tracker.static_model:
@@ -369,8 +375,34 @@ class FaceInfo():
             self.eye_blink.append(1 - min(max(0, -self.current_features["eye_l"]), 1))
 
 class Tracker():
-    def __init__(self, width, height, model_type=3, detection_threshold=0.6, threshold=None, max_faces=1, discard_after=5, scan_every=3, bbox_growth=0.0, max_threads=4, silent=False, model_dir=None, no_gaze=False, use_retinaface=False, max_feature_updates=0, static_model=False, feature_level=2, try_hard=False, ov_device="GPU", debug_compare_device=False):
-        self.model_type = model_type
+    """
+    OpenVINO-based face tracker for real-time facial landmark detection and 3D head pose estimation.
+
+    Provides 66-point facial landmark tracking, gaze estimation, and 3D head pose calculation
+    using MobileNetV3-based models optimized for OpenVINO inference.
+    """
+
+    def __init__(self, width, height, detection_threshold=0.6, threshold=None, max_faces=1, discard_after=5, scan_every=3, bbox_growth=0.0, max_threads=4, silent=False, model_dir=None, use_retinaface=False, max_feature_updates=0, static_model=False, feature_level=2, device="GPU", debug_compare_device=False):
+        """
+        Initialize the face tracker.
+
+        Args:
+            width: Input frame width
+            height: Input frame height
+            detection_threshold: Minimum confidence for face detection (default=0.6)
+            threshold: Minimum confidence for landmark tracking (default=0.6)
+            max_faces: Maximum number of faces to track (default=1)
+            discard_after: Frames to keep searching for lost faces (default=5)
+            scan_every: Scan interval for new faces (default=3)
+            max_threads: Maximum number of inference threads (default=4)
+            silent: Suppress console output (default=False)
+            model_dir: Custom directory for model files (default=None)
+            use_retinaface: Use RetinaFace for face detection (default=False)
+            max_feature_updates: Time limit for feature calibration in seconds (default=0, unlimited)
+            static_model: Disable 3D model adaptation (default=False)
+            device: OpenVINO device selection - CPU, GPU, or NPU (default="GPU")
+        """
+        self.model_type = 3
         # Runtime state
         self.frame_count = 0
         self.width = width
@@ -385,31 +417,24 @@ class Tracker():
         self.scan_every = scan_every
         self.bbox_growth = bbox_growth
         self.silent = silent
-        self.try_hard = try_hard
         self.core = ov.Core()
-        self.device = str(ov_device).upper()
+
+        # Enable model caching for faster startup
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".ov_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        self.core.set_property({"CACHE_DIR": cache_dir})
+
+        self.device = str(device).upper()
         if self.device not in ("CPU", "GPU", "NPU"):
             self.device = "GPU"
         self.core.set_property(self.device, {"PERFORMANCE_HINT": "LATENCY"})
         self.is_npu = self.device == "NPU"
         self.inference_precision = ov.Type.f16 if self.is_npu else ov.Type.f32
         self.umat_enabled = hasattr(cv2, "UMat")
-        self.models = [
-            "lm_model0_opt",
-            "lm_model1_opt",
-            "lm_model2_opt",
-            "lm_model3_opt",
-            "lm_model4_opt"
-        ]
-        model = "lm_modelT_opt"
-        if model_type >= 0:
-            model = self.models[self.model_type]
-        if model_type == -2:
-            model = "lm_modelV_opt"
-        if model_type == -3:
-            model = "lm_modelU_opt"
+
+        # Using model 3 (best quality)
+        model = "lm_model3_opt"
         ov_model_base_path = get_ov_model_base_path(model_dir)
-        model_base_path = get_model_base_path(model_dir)
         required_models = {f"{model}.xml", "mnv3_detection_opt.xml", "mnv3_gaze32_split_opt.xml"}
         for required_model in required_models:
             if not os.path.exists(os.path.join(ov_model_base_path, required_model)):
@@ -417,21 +442,19 @@ class Tracker():
 
         if threshold is None:
             threshold = 0.6
-            if model_type < 0:
-                threshold = 0.87
         self.threshold = threshold
 
         retina_model_path = os.path.join(ov_model_base_path, "retinaface_640x640_opt.xml")
         if not os.path.exists(retina_model_path):
             raise FileNotFoundError(f"Could not find OpenVINO model retinaface_640x640_opt.xml in {ov_model_base_path}")
-        priorbox_path = os.path.join(model_base_path, "priorbox_640x640.json")
+        priorbox_path = os.path.join(ov_model_base_path, "priorbox_640x640.json")
         retina_requests = min(max(1, max_faces), 4)
         self.retinaface = RetinaFaceDetector(
             model_path=retina_model_path,
             json_path=priorbox_path,
             device=self.device,
             top_k=max_faces,
-            res=(640, 640),
+            res=RETINAFACE_RESOLUTION,
             async_requests=retina_requests,
             core=self.core,
         )
@@ -458,11 +481,8 @@ class Tracker():
         self.debug_compare_counter = 0
         self.debug_compare_limit = 50
 
+        # Model 3 uses 224x224 resolution
         lm_res = 224
-        if model_type < 0:
-            lm_res = 56
-        if model_type < -1:
-            lm_res = 112
         landmark_path = os.path.join(ov_model_base_path, f"{model}.xml")
         compile_config = self._compile_config(self.device)
         if self.use_preproc:
@@ -476,7 +496,6 @@ class Tracker():
             )
         else:
             landmark_model = self.core.read_model(landmark_path)
-            #self.session = self.core.compile_model(landmark_model, self.device)
             with temporary_full_cpu_affinity(self.device):
                 self.session = self.core.compile_model(
                     landmark_model,
@@ -498,7 +517,6 @@ class Tracker():
                 )
             else:
                 ref_landmark_model = self.core.read_model(landmark_path)
-                #ref_session = self.core.compile_model(ref_landmark_model, self.reference_device)
                 with temporary_full_cpu_affinity(self.reference_device):
                     ref_session = self.core.compile_model(
                         ref_landmark_model,
@@ -562,7 +580,6 @@ class Tracker():
             )
         else:
             detection_model = self.core.read_model(detection_path)
-            #self.detection = self.core.compile_model(detection_model, self.device)
             with temporary_full_cpu_affinity(self.device):
                 self.detection = self.core.compile_model(
                     detection_model, 
@@ -584,7 +601,6 @@ class Tracker():
                 )
             else:
                 ref_detection_raw = self.core.read_model(detection_path)
-                #ref_detection_model = self.core.compile_model(ref_detection_raw, self.reference_device)
                 with temporary_full_cpu_affinity(self.reference_device):
                     ref_detection_model = self.core.compile_model(
                         ref_detection_raw, 
@@ -688,35 +704,19 @@ class Tracker():
         self.inverse_camera = np.linalg.inv(self.camera)
         self.dist_coeffs = np.zeros((4,1))
 
+        # Model 3 parameters
         self.res = 224.
         self.mean_res = self.mean_224
         self.std_res = self.std_224
-        if model_type < 0:
-            self.res = 56.
-            self.mean_res = np.tile(self.mean, [56, 56, 1])
-            self.std_res = np.tile(self.std, [56, 56, 1])
-        if model_type < -1:
-            self.res = 112.
-            self.mean_res = np.tile(self.mean, [112, 112, 1])
-            self.std_res = np.tile(self.std, [112, 112, 1])
         self.res_i = int(self.res)
         self.out_res = 27.
-        if model_type < 0:
-            self.out_res = 6.
-        if model_type < -1:
-            self.out_res = 13.
         self.out_res_i = int(self.out_res) + 1
         self.logit_factor = 16.
-        if model_type < 0:
-            self.logit_factor = 8.
-        if model_type < -1:
-            self.logit_factor = 16.
 
-        self.no_gaze = no_gaze
+        # Gaze tracking always enabled
+        self.no_gaze = False
         self.debug_gaze = False
         self.feature_level = feature_level
-        if model_type == -1:
-            self.feature_level = min(feature_level, 1)
         self.max_feature_updates = max_feature_updates
         self.static_model = static_model
         self.face_info = [FaceInfo(id, self) for id in range(max_faces)]
@@ -774,6 +774,16 @@ class Tracker():
         return results
 
     def landmarks(self, tensor, crop_info):
+        """
+        Extract facial landmarks from model output tensor.
+
+        Args:
+            tensor: Model output tensor containing landmark heatmaps and offsets
+            crop_info: Tuple of (x1, y1, scale_x, scale_y, info) for coordinate transformation
+
+        Returns:
+            Tuple of (average_confidence, landmarks_array) where landmarks_array is Nx3 (x, y, confidence)
+        """
         crop_x1, crop_y1, scale_x, scale_y, _ = crop_info
         avg_conf = 0
         res = self.res - 1
@@ -795,10 +805,6 @@ class Tracker():
         lms[np.isnan(lms).any(axis=1)] = np.array([0.,0.,0.], dtype=np.float32)
         if self.model_type == -1:
             lms = lms[[0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,6,7,7,8,8,9,10,10,11,11,12,21,21,21,22,23,23,23,23,23,13,14,14,15,16,16,17,18,18,19,20,20,24,25,25,25,26,26,27,27,27,24,24,28,28,28,26,29,29,29]]
-            #lms[[1,3,4,6,7,9,10,12,13,15,18,20,23,25,38,40,44,46]] += lms[[2,2,5,5,8,8,11,11,14,16,19,21,24,26,39,39,45,45]]
-            #lms[[3,4,6,7,9,10,12,13]] += lms[[5,5,8,8,11,11,14,14]]
-            #lms[[1,15,18,20,23,25,38,40,44,46]] /= 2.0
-            #lms[[3,4,6,7,9,10,12,13]] /= 3.0
             part_avg = np.mean(np.partition(lms[:,2],3)[0:3])
             if part_avg < 0.65:
                 avg_conf = part_avg
@@ -847,10 +853,9 @@ class Tracker():
         for i, pt in enumerate(face_info.face_3d[66:70]):
             if i == 2:
                 # Right eyeball
-                # Eyeballs have an average diameter of 12.5mm and and the distance between eye corners is 30-35mm, so a conversion factor of 0.385 can be applied
                 eye_center = (pts_3d[36] + pts_3d[39]) / 2.0
                 d_corner = np.linalg.norm(pts_3d[36] - pts_3d[39])
-                depth = 0.385 * d_corner
+                depth = EYE_DEPTH_CONVERSION_FACTOR * d_corner
                 pt_3d = np.array([eye_center[0], eye_center[1], eye_center[2] - depth])
                 pts_3d[68] = pt_3d
                 continue
@@ -858,7 +863,7 @@ class Tracker():
                 # Left eyeball
                 eye_center = (pts_3d[42] + pts_3d[45]) / 2.0
                 d_corner = np.linalg.norm(pts_3d[42] - pts_3d[45])
-                depth = 0.385 * d_corner
+                depth = EYE_DEPTH_CONVERSION_FACTOR * d_corner
                 pt_3d = np.array([eye_center[0], eye_center[1], eye_center[2] - depth])
                 pts_3d[69] = pt_3d
                 continue
@@ -885,7 +890,7 @@ class Tracker():
         pts_3d[np.isnan(pts_3d).any(axis=1)] = np.array([0.,0.,0.], dtype=np.float32)
 
         pnp_error = np.sqrt(pnp_error / (2.0 * image_pts.shape[0]))
-        if pnp_error > 300:
+        if pnp_error > MAX_PNP_ERROR:
             face_info.fail_count += 1
             if face_info.fail_count > 5:
                 # Something went wrong with adjusting the 3D model
@@ -988,6 +993,17 @@ class Tracker():
         return frame, lms, offset
 
     def get_eye_state(self, frame, lms):
+        """
+        Estimate eye openness and gaze direction for both eyes.
+
+        Args:
+            frame: Input image frame
+            lms: Facial landmarks array
+
+        Returns:
+            List of two tuples [(right_eye), (left_eye)] where each tuple contains
+            (openness, gaze_x, gaze_y, rotation_angle)
+        """
         if self.no_gaze:
             return [(1.0, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)]
         lms = np.array(lms)
@@ -1099,6 +1115,16 @@ class Tracker():
                 face_info.update(None, None, self.frame_count)
 
     def predict(self, frame, additional_faces=[]):
+        """
+        Perform face tracking on a single frame.
+
+        Args:
+            frame: Input image as numpy array (BGR format)
+            additional_faces: Optional list of additional face bounding boxes to track
+
+        Returns:
+            List of FaceInfo objects containing landmarks, 3D pose, gaze, and facial features
+        """
         self.frame_count += 1
         start = time.perf_counter()
         im = frame
@@ -1117,13 +1143,11 @@ class Tracker():
         self.wait_count += 1
         if self.detected == 0:
             start_fd = time.perf_counter()
-            if self.use_retinaface > 0 or self.try_hard:
+            if self.use_retinaface > 0:
                 retinaface_detections = self.retinaface.detect_retina(frame)
                 new_faces.extend(retinaface_detections)
-            if self.use_retinaface == 0 or self.try_hard:
+            else:
                 new_faces.extend(self.detect_faces(frame))
-            if self.try_hard:
-                new_faces.extend([(0, 0, self.width, self.height)])
             duration_fd = 1000 * (time.perf_counter() - start_fd)
             self.wait_count = 0
         elif self.detected < self.max_faces:
@@ -1179,7 +1203,7 @@ class Tracker():
             if conf > self.threshold:
                 try:
                     eye_state = self.get_eye_state(frame, lms)
-                except:
+                except Exception:
                     eye_state = [(1.0, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)]
                 outputs[info] = (conf, (lms, eye_state), 0)
 

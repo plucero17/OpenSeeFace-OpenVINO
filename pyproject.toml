@@ -1,20 +1,25 @@
-[tool.poetry]
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
 name = "openseeface"
 version = "1.20.4"
-description = ""
-authors = ["emilianavt"]
-license = "BSD-2-Clause"
+description = "OpenVINO-based facial landmark detection and head pose estimation"
+authors = [{name = "emilianavt"}]
+license = {text = "BSD-2-Clause"}
+requires-python = ">=3.7"
+dependencies = [
+    "numpy>=1.26.4",
+    "opencv-python>=4.10.0",
+    "Pillow>=10.4.0",
+    "openvino>=2024.5.0",
+    "psutil>=6.1.0",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.7,<=3.12"
-numpy = "^1.21.3"
-opencv-python = "^4.5.4"
-Pillow = "^8.4.0"
-onnxruntime = "^1.9.0"
-openvino = "^2023.2.0"
+[project.urls]
+Homepage = "https://github.com/emilianavt/OpenSeeFace"
 
-[tool.poetry.dev-dependencies]
-
-[build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+[tool.setuptools.packages.find]
+include = ["ovbackend*"]
+exclude = ["escapi*", "Licenses*", "dshowcapture*"]

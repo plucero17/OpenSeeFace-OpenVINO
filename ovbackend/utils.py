@@ -20,16 +20,6 @@ def get_ov_model_base_path(model_dir):
     return model_base_path
 
 
-def get_model_base_path(model_dir):
-    model_base_path = resolve(os.path.join("models"))
-    if model_dir is None:
-        if not os.path.exists(model_base_path):
-            model_base_path = resolve(os.path.join("..", "models"))
-    else:
-        model_base_path = model_dir
-    return model_base_path
-
-
 @contextmanager
 def temporary_full_cpu_affinity(device):
     """

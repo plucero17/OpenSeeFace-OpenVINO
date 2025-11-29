@@ -91,7 +91,7 @@ class DShowCaptureReader(VideoReader):
         img = None
         try:
             img = self.device.get_frame(self.timeout)
-        except:
+        except Exception:
             gc.collect()
             img = self.device.get_frame(self.timeout)
         if img is None:
@@ -121,36 +121,10 @@ class OpenCVReader(VideoReader):
     def close(self):
         super(OpenCVReader, self).close()
 
-class RawReader:
-    def __init__(self, width, height):
-        self.width = int(width)
-        self.height = int(height)
-        
-        if self.width < 1 or self.height < 1:
-            print("No acceptable size was given for reading raw RGB frames.")
-            sys.exit(0)
-
-        self.len = self.width * self.height * 3
-        self.open = True
-    def is_open(self):
-        return self.open
-    def is_ready(self):
-        return True
-    def read(self):
-        frame = bytearray()
-        read_bytes = 0
-        while read_bytes < self.len:
-            bytes = sys.stdin.buffer.read(self.len)
-            read_bytes += len(bytes)
-            frame.extend(bytes)
-        return True, np.frombuffer(frame, dtype=np.uint8).reshape((self.height, self.width, 3))
-    def close(self):
-        self.open = False
-
 def try_int(s):
     try:
         return int(s)
-    except:
+    except (ValueError, TypeError):
         return None
 
 def test_reader(reader):
@@ -172,19 +146,17 @@ def test_reader(reader):
             return got_any > 0
         print("Fail")
         return False
-    except:
+    except Exception:
         traceback.print_exc()
         print("Except")
         return False
 
 class InputReader():
-    def __init__(self, capture, raw_rgb, width, height, fps, use_dshowcapture=False, dcap=None):
+    def __init__(self, capture, width, height, fps, use_dshowcapture=False, dcap=None):
         self.reader = None
         self.name = str(capture)
         try:
-            if raw_rgb > 0:
-                self.reader = RawReader(width, height)
-            elif os.path.exists(capture):
+            if os.path.exists(capture):
                 self.reader = VideoReader(capture)
             elif capture == str(try_int(capture)):
                 if os.name == 'nt':
@@ -199,7 +171,7 @@ class InputReader():
                             self.name = name
                         else:
                             good = False
-                    except:
+                    except Exception:
                         print("DShowCapture exception: ")
                         traceback.print_exc()
                         good = False
@@ -222,7 +194,7 @@ class InputReader():
                             print(f"Found device {name} as {i}.", file=sys.stderr)
                             self.reader = EscapiReader(found, width, height, fps)
                             good = test_reader(self.reader)
-                    except:
+                    except Exception:
                         print("Escapi exception: ")
                         traceback.print_exc()
                         good = False
