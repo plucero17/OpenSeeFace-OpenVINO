@@ -32,7 +32,7 @@ fi
 echo "Building OpenVINO binary"
 pyinstaller --clean --onedir facetracker.py \
     --name facetracker_openvino \
-    --add-data "ov-models:ov-models" \
+    --add-data "ov_models:ov_models" \
     --add-data "models:models" \
     --add-binary "${OV_LIB_DIR}/*.so:openvino/libs"
 

@@ -4,9 +4,9 @@ import cv2
 import time
 import copy
 import openvino as ov
-from openvino.properties import hint
-from remedian import remedian
-from .retinaface import RetinaFaceDetector
+import openvino.properties as props
+import openvino.properties.hint as ov_hint
+from .remedian import remedian
 from .utils import get_ov_model_base_path, temporary_full_cpu_affinity
 from .processor import build_preprocessed_model
 from .infer_utils import InferRequestPool
@@ -16,14 +16,12 @@ from .math_utils import (
     angle,
     compensate,
     rotate_image,
-    group_rects,
     logit,
     logit_arr,
     matrix_to_quaternion,
 )
 
 # Configuration constants
-RETINAFACE_RESOLUTION = (640, 640)
 MIN_CONFIDENCE_THRESHOLD = 0.4
 MAX_PNP_ERROR = 300
 EYE_DEPTH_CONVERSION_FACTOR = 0.385  # Eyeball diameter (12.5mm) / eye corner distance (30-35mm)
@@ -382,7 +380,7 @@ class Tracker():
     using MobileNetV3-based models optimized for OpenVINO inference.
     """
 
-    def __init__(self, width, height, detection_threshold=0.6, threshold=None, max_faces=1, discard_after=5, scan_every=3, bbox_growth=0.0, max_threads=4, silent=False, model_dir=None, use_retinaface=False, max_feature_updates=0, static_model=False, feature_level=2, device="GPU", debug_compare_device=False):
+    def __init__(self, width, height, detection_threshold=0.6, threshold=None, discard_after=5, scan_every=3, bbox_growth=0.0, max_threads=4, silent=False, model_dir=None, max_feature_updates=0, static_model=False, feature_level=2, device="GPU", preproc_backend="opencv"):
         """
         Initialize the face tracker.
 
@@ -391,16 +389,15 @@ class Tracker():
             height: Input frame height
             detection_threshold: Minimum confidence for face detection (default=0.6)
             threshold: Minimum confidence for landmark tracking (default=0.6)
-            max_faces: Maximum number of faces to track (default=1)
             discard_after: Frames to keep searching for lost faces (default=5)
             scan_every: Scan interval for new faces (default=3)
             max_threads: Maximum number of inference threads (default=4)
             silent: Suppress console output (default=False)
             model_dir: Custom directory for model files (default=None)
-            use_retinaface: Use RetinaFace for face detection (default=False)
             max_feature_updates: Time limit for feature calibration in seconds (default=0, unlimited)
             static_model: Disable 3D model adaptation (default=False)
             device: OpenVINO device selection - CPU, GPU, or NPU (default="GPU")
+            preproc_backend: "openvino" to enable OV pre-processing, otherwise OpenCV path
         """
         self.model_type = 3
         # Runtime state
@@ -408,16 +405,16 @@ class Tracker():
         self.width = width
         self.height = height
         self.detection_threshold = detection_threshold
-        self.max_faces = max_faces
         self.max_threads = max_threads
         self.discard = 0
         self.discard_after = discard_after
-        self.detected = 0
+        self.detected = False
         self.wait_count = 0
         self.scan_every = scan_every
         self.bbox_growth = bbox_growth
         self.silent = silent
         self.core = ov.Core()
+        self.face_bbox = None
 
         # Enable model caching for faster startup
         cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".ov_cache")
@@ -427,75 +424,59 @@ class Tracker():
         self.device = str(device).upper()
         if self.device not in ("CPU", "GPU", "NPU"):
             self.device = "GPU"
-        self.core.set_property(self.device, {"PERFORMANCE_HINT": "LATENCY"})
         self.is_npu = self.device == "NPU"
         self.inference_precision = ov.Type.f16 if self.is_npu else ov.Type.f32
         self.umat_enabled = hasattr(cv2, "UMat")
+        self.request_pool_size = min(max(1, max_threads), 4)
+        self.core.set_property(self.device, self._device_properties())
 
         # Using model 3 (best quality)
-        model = "lm_model3_opt"
         ov_model_base_path = get_ov_model_base_path(model_dir)
-        required_models = {f"{model}.xml", "mnv3_detection_opt.xml", "mnv3_gaze32_split_opt.xml"}
-        for required_model in required_models:
-            if not os.path.exists(os.path.join(ov_model_base_path, required_model)):
-                raise FileNotFoundError(f"Could not find OpenVINO model {required_model} in {ov_model_base_path}")
+        def resolve_model(subdir, filename):
+            directory = os.path.join(ov_model_base_path, subdir)
+            path = os.path.join(directory, filename)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Could not find OpenVINO model {filename} in {directory}")
+            return path
+        landmark_path = resolve_model("landmark-mobilenet-v3", "landmark-mobilenet-v3.xml")
+        detection_path = resolve_model("headmap-detector-mobilenet-v3", "headmap-detector-mobilenet-v3.xml")
+        gaze_path = resolve_model("gaze-estimator-mobilenet-v3", "gaze-estimator-mobilenet-v3.xml")
 
         if threshold is None:
             threshold = 0.6
         self.threshold = threshold
 
-        retina_model_path = os.path.join(ov_model_base_path, "retinaface_640x640_opt.xml")
-        if not os.path.exists(retina_model_path):
-            raise FileNotFoundError(f"Could not find OpenVINO model retinaface_640x640_opt.xml in {ov_model_base_path}")
-        priorbox_path = os.path.join(ov_model_base_path, "priorbox_640x640.json")
-        retina_requests = min(max(1, max_faces), 4)
-        self.retinaface = RetinaFaceDetector(
-            model_path=retina_model_path,
-            json_path=priorbox_path,
-            device=self.device,
-            top_k=max_faces,
-            res=RETINAFACE_RESOLUTION,
-            async_requests=retina_requests,
-            core=self.core,
-        )
-        self.use_retinaface = use_retinaface
-
-        self.use_preproc = self.device in ("CPU", "GPU", "NPU")
-        # Pre-processing via OpenVINO's pipeline works well for face boxes/landmarks,
-        # but currently breaks gaze estimation. Keep a dedicated flag so gaze falls
-        # back to the original manual normalization logic.
-        self.use_gaze_preproc = False
+        self.preproc_backend = str(preproc_backend).lower()
+        requested_preproc = self.preproc_backend == "openvino"
+        # Track per-model pre-processing so we can fall back gracefully if any path fails.
+        self.use_landmark_preproc = requested_preproc
+        self.use_detection_preproc = requested_preproc
+        self.use_gaze_preproc = requested_preproc
         self.single_eye_gaze = self.is_npu
-        self.tensor_wrapper = None
-        self.request_pool_size = min(max(1, max_threads), 4)
-        self.debug_compare_device = debug_compare_device
-        self.reference_device = "CPU"
-        self.reference_precision = ov.Type.f16 if self.reference_device == "NPU" else ov.Type.f32
-        self.reference_enabled = self.debug_compare_device and self.device != self.reference_device
-        self.reference_detection_pool = None
-        self.reference_landmark_pool = None
-        self.reference_gaze_pool = None
-        self.reference_detection_input_name = None
-        self.reference_input_name = None
-        self.reference_gaze_input_name = None
-        self.debug_compare_counter = 0
-        self.debug_compare_limit = 50
 
         # Model 3 uses 224x224 resolution
         lm_res = 224
-        landmark_path = os.path.join(ov_model_base_path, f"{model}.xml")
         compile_config = self._compile_config(self.device)
-        if self.use_preproc:
-            self.session = build_preprocessed_model(
-                self.core,
-                landmark_path,
-                self.device,
-                (lm_res, lm_res),
-                precision=self.inference_precision,
-                compile_props=compile_config,
-            )
-        else:
+        if self.use_landmark_preproc:
+            try:
+                self.session = build_preprocessed_model(
+                    self.core,
+                    landmark_path,
+                    self.device,
+                    (lm_res, lm_res),
+                    precision=self.inference_precision,
+                    compile_props=compile_config,
+                )
+            except Exception as exc:
+                self.use_landmark_preproc = False
+                if not self.silent:
+                    print(
+                        f"OpenVINO preprocessing for landmarks disabled ({exc}). "
+                        f"Falling back to OpenCV preprocessing."
+                    )
+        if not self.use_landmark_preproc:
             landmark_model = self.core.read_model(landmark_path)
+            self._reshape_model(landmark_model, [1, 3, lm_res, lm_res])
             with temporary_full_cpu_affinity(self.device):
                 self.session = self.core.compile_model(
                     landmark_model,
@@ -503,116 +484,67 @@ class Tracker():
                     config=compile_config,
                 )
         self.input_name = self.session.input(0).get_any_name()
-        if self.reference_enabled:
-            ref_compile_config = self._compile_config(self.reference_device)
-            ref_precision = ov.Type.f16 if self.reference_device == "NPU" else ov.Type.f32
-            if self.use_preproc:
-                ref_session = build_preprocessed_model(
-                    self.core,
-                    landmark_path,
-                    self.reference_device,
-                    (lm_res, lm_res),
-                    precision=ref_precision,
-                    compile_props=ref_compile_config,
-                )
-            else:
-                ref_landmark_model = self.core.read_model(landmark_path)
-                with temporary_full_cpu_affinity(self.reference_device):
-                    ref_session = self.core.compile_model(
-                        ref_landmark_model,
-                        self.reference_device,
-                        config=ref_compile_config,
-                    )
-            self.reference_input_name = ref_session.input(0).get_any_name()
-            self.reference_landmark_pool = InferRequestPool(ref_session, pool_size=1)
-        gaze_path = os.path.join(ov_model_base_path, "mnv3_gaze32_split_opt.xml")
         gaze_compile_config = self._compile_config(self.device)
         if self.use_gaze_preproc:
-            self.gaze_model = build_preprocessed_model(
-                self.core,
-                gaze_path,
-                self.device,
-                (32, 32),
-                batch_size=1 if self.single_eye_gaze else 2,
-                precision=self.inference_precision,
-                compile_props=gaze_compile_config,
-            )
-        else:
+            try:
+                self.gaze_model = build_preprocessed_model(
+                    self.core,
+                    gaze_path,
+                    self.device,
+                    (32, 32),
+                    batch_size=1 if self.single_eye_gaze else 2,
+                    precision=self.inference_precision,
+                    compile_props=gaze_compile_config,
+                )
+            except Exception as exc:
+                self.use_gaze_preproc = False
+                if not self.silent:
+                    print(
+                        f"OpenVINO preprocessing for gaze disabled ({exc}). "
+                        f"Reverting to manual normalization."
+                    )
+        if not self.use_gaze_preproc:
             gaze_model = self.core.read_model(gaze_path)
+            gaze_batch = 1 if self.single_eye_gaze else 2
+            self._reshape_model(gaze_model, [gaze_batch, 3, 32, 32])
             with temporary_full_cpu_affinity(self.device):
                 self.gaze_model = self.core.compile_model(
                     gaze_model, self.device, config=gaze_compile_config
                 )
             
         self.gaze_input_name = self.gaze_model.input(0).get_any_name()
-        if self.reference_enabled:
-            ref_gaze_config = self._compile_config(self.reference_device)
-            ref_gaze_precision = ov.Type.f16 if self.reference_device == "NPU" else ov.Type.f32
-            if self.use_gaze_preproc:
-                ref_gaze_model = build_preprocessed_model(
-                    self.core,
-                    gaze_path,
-                    self.reference_device,
-                    (32, 32),
-                    batch_size=1 if self.reference_device == "NPU" else 2,
-                    precision=ref_gaze_precision,
-                    compile_props=ref_gaze_config,
-                )
-            else:
-                ref_gaze_raw = self.core.read_model(gaze_path)
-                with temporary_full_cpu_affinity(self.reference_device):
-                    ref_gaze_model = self.core.compile_model(
-                        ref_gaze_raw, self.reference_device, config=ref_gaze_config
-                    )
-            self.reference_gaze_input_name = ref_gaze_model.input(0).get_any_name()
-            self.reference_gaze_pool = InferRequestPool(ref_gaze_model, pool_size=1)
 
-        detection_path = os.path.join(ov_model_base_path, "mnv3_detection_opt.xml")
         detection_compile_config = self._compile_config(self.device)
-        if self.use_preproc:
-            self.detection = build_preprocessed_model(
-                self.core,
-                detection_path,
-                self.device,
-                (224, 224),
-                precision=self.inference_precision,
-                compile_props=detection_compile_config,
-            )
-        else:
+        if self.use_detection_preproc:
+            try:
+                self.detection = build_preprocessed_model(
+                    self.core,
+                    detection_path,
+                    self.device,
+                    (224, 224),
+                    precision=self.inference_precision,
+                    compile_props=detection_compile_config,
+                )
+            except Exception as exc:
+                self.use_detection_preproc = False
+                if not self.silent:
+                    print(
+                        f"OpenVINO preprocessing for detection disabled ({exc}). "
+                        f"Using OpenCV preprocessing for detector inputs."
+                    )
+        if not self.use_detection_preproc:
             detection_model = self.core.read_model(detection_path)
+            self._reshape_model(detection_model, [1, 3, 224, 224])
             with temporary_full_cpu_affinity(self.device):
                 self.detection = self.core.compile_model(
-                    detection_model, 
+                    detection_model,
                     self.device,
                     config=detection_compile_config,
                 )
         self.detection_input_name = self.detection.input(0).get_any_name()
-        if self.reference_enabled:
-            ref_detection_config = self._compile_config(self.reference_device)
-            ref_detection_precision = ov.Type.f16 if self.reference_device == "NPU" else ov.Type.f32
-            if self.use_preproc:
-                ref_detection_model = build_preprocessed_model(
-                    self.core,
-                    detection_path,
-                    self.reference_device,
-                    (224, 224),
-                    precision=ref_detection_precision,
-                    compile_props=ref_detection_config,
-                )
-            else:
-                ref_detection_raw = self.core.read_model(detection_path)
-                with temporary_full_cpu_affinity(self.reference_device):
-                    ref_detection_model = self.core.compile_model(
-                        ref_detection_raw, 
-                        self.reference_device,
-                        config=ref_detection_config,
-                    )
-            self.reference_detection_input_name = ref_detection_model.input(0).get_any_name()
-            self.reference_detection_pool = InferRequestPool(ref_detection_model, pool_size=1)
-        self.landmark_pool = InferRequestPool(self.session, pool_size=self.request_pool_size, tensor_wrapper=self.tensor_wrapper)
-        self.gaze_pool = InferRequestPool(self.gaze_model, pool_size=self.request_pool_size, tensor_wrapper=self.tensor_wrapper)
-        self.detection_pool = InferRequestPool(self.detection, pool_size=self.request_pool_size, tensor_wrapper=self.tensor_wrapper)
-        self.faces = []
+        self.landmark_pool = InferRequestPool(self.session, pool_size=self.request_pool_size)
+        self.gaze_pool = InferRequestPool(self.gaze_model, pool_size=self.request_pool_size)
+        self.detection_pool = InferRequestPool(self.detection, pool_size=self.request_pool_size)
 
         self.mean = np.float32(np.array([0.485, 0.456, 0.406]))
         self.std = np.float32(np.array([0.229, 0.224, 0.225]))
@@ -719,33 +651,54 @@ class Tracker():
         self.feature_level = feature_level
         self.max_feature_updates = max_feature_updates
         self.static_model = static_model
-        self.face_info = [FaceInfo(id, self) for id in range(max_faces)]
-        self.fail_count = 0
+        self.face_info = FaceInfo(0, self)
 
     def _to_umat(self, image):
         if self.umat_enabled and image is not None and not isinstance(image, cv2.UMat):
             return cv2.UMat(image)
         return image
 
+    def _device_properties(self):
+        return {
+            ov_hint.performance_mode: ov_hint.PerformanceMode.LATENCY,
+            ov_hint.num_requests: str(self.request_pool_size),
+            props.streams.num: "1",
+            props.enable_profiling: False,
+        }
+
     def _compile_config(self, device):
         precision = ov.Type.f16 if device == "NPU" else ov.Type.f32
         config = {
-            hint.inference_precision: precision,
+            ov_hint.inference_precision: precision,
+            ov_hint.performance_mode: ov_hint.PerformanceMode.LATENCY,
+            ov_hint.num_requests: str(self.request_pool_size),
+            props.streams.num: "1",
+            props.enable_profiling: False,
         }
         if device == "GPU":
             config["GPU_DISABLE_WINOGRAD_CONVOLUTION"] = "YES"
         return config
+
+    def _reshape_model(self, model, shape):
+        try:
+            model.reshape(shape)
+        except Exception:
+            try:
+                model.reshape({model.input(0): shape})
+            except Exception:
+                pass
+        return model
 
     def _from_umat(self, image):
         if self.umat_enabled and isinstance(image, cv2.UMat):
             return image.get()
         return image
 
-    def detect_faces(self, frame):
+    def detect_face(self, frame):
         work = self._to_umat(frame)
         im = cv2.resize(work, (224, 224), interpolation=cv2.INTER_LINEAR)
         im = self._from_umat(im)
-        if self.use_preproc:
+        if self.use_detection_preproc:
             im = np.expand_dims(np.ascontiguousarray(im), 0)
         else:
             im = im[:,:,::-1] * self.std_224 + self.mean_224
@@ -756,22 +709,26 @@ class Tracker():
         maxpool = np.array(maxpool)
         outputs[0, 0, outputs[0, 0] != maxpool[0, 0]] = 0
         detections = np.flip(np.argsort(outputs[0,0].flatten()))
-        results = []
-        for det in detections[0:self.max_faces]:
+        best = None
+        best_conf = 0.0
+        for det in detections:
             y, x = det // 56, det % 56
             c = outputs[0, 0, y, x]
             r = outputs[0, 1, y, x] * 112.
             x *= 4
             y *= 4
-            r *= 1.0
             if c < self.detection_threshold:
                 break
-            results.append((x - r, y - r, 2 * r, 2 * r * 1.0))
-        results = np.array(results).astype(np.float32)
-        if results.shape[0] > 0:
-            results[:, [0,2]] *= frame.shape[1] / 224.
-            results[:, [1,3]] *= frame.shape[0] / 224.
-        return results
+            bbox = (x - r, y - r, 2 * r, 2 * r)
+            if c > best_conf:
+                best_conf = c
+                best = bbox
+        if best is None:
+            return None
+        result = np.array(best, dtype=np.float32)
+        result[[0, 2]] *= frame.shape[1] / 224.
+        result[[1, 3]] *= frame.shape[0] / 224.
+        return tuple(result.tolist())
 
     def landmarks(self, tensor, crop_info):
         """
@@ -915,23 +872,13 @@ class Tracker():
         roi = self._to_umat(roi)
         roi = cv2.resize(roi, (self.res_i, self.res_i), interpolation=cv2.INTER_LINEAR)
         roi = self._from_umat(roi)
-        if self.use_preproc:
+        if self.use_landmark_preproc:
             roi = np.expand_dims(np.ascontiguousarray(roi), 0)
         else:
             roi = np.float32(roi[:,:,::-1]) * self.std_res + self.mean_res
             roi = np.expand_dims(roi, 0)
             roi = np.transpose(roi, (0,3,1,2))
         return roi
-
-    def equalize(self, im):
-        im = self._to_umat(im)
-        im_yuv = cv2.cvtColor(im, cv2.COLOR_BGR2YUV)
-        channel = im_yuv[:,:,0]
-        channel = self._from_umat(channel)
-        channel = cv2.equalizeHist(channel)
-        im_yuv[:,:,0] = channel
-        result = cv2.cvtColor(im_yuv, cv2.COLOR_YUV2BGR)
-        return self._from_umat(result)
 
     def corners_to_eye(self, corners, w, h, flip):
         ((cx1, cy1), (cx2, cy2)) = corners
@@ -1072,55 +1019,12 @@ class Tracker():
         eye_state[np.isnan(eye_state).any(axis=1)] = np.array([1.,0.,0.,0.], dtype=np.float32)
         return eye_state
 
-    def assign_face_info(self, results):
-        if self.max_faces == 1 and len(results) == 1:
-            conf, (lms, eye_state), conf_adjust = results[0]
-            self.face_info[0].update((conf - conf_adjust, (lms, eye_state)), np.array(lms)[:, 0:2].mean(0), self.frame_count)
-            return
-        result_coords = []
-        adjusted_results = []
-        for conf, (lms, eye_state), conf_adjust in results:
-            adjusted_results.append((conf - conf_adjust, (lms, eye_state)))
-            result_coords.append(np.array(lms)[:, 0:2].mean(0))
-        results = adjusted_results
-        candidates = [[]] * self.max_faces
-        max_dist = 2 * np.linalg.norm(np.array([self.width, self.height]))
-        for i, face_info in enumerate(self.face_info):
-            for j, coord in enumerate(result_coords):
-                if face_info.coord is None:
-                    candidates[i].append((max_dist, i, j))
-                else:
-                    candidates[i].append((np.linalg.norm(face_info.coord - coord), i, j))
-        for i, candidate in enumerate(candidates):
-            candidates[i] = sorted(candidate)
-        found = 0
-        target = len(results)
-        used_results = {}
-        used_faces = {}
-        while found < target:
-            min_list = min(candidates)
-            candidate = min_list.pop(0)
-            face_idx = candidate[1]
-            result_idx = candidate[2]
-            if not result_idx in used_results and not face_idx in used_faces:
-                self.face_info[face_idx].update(results[result_idx], result_coords[result_idx], self.frame_count)
-                min_list.clear()
-                used_results[result_idx] = True
-                used_faces[face_idx] = True
-                found += 1
-            if len(min_list) == 0:
-                min_list.append((2 * max_dist, face_idx, result_idx))
-        for face_info in self.face_info:
-            if face_info.frame_count != self.frame_count:
-                face_info.update(None, None, self.frame_count)
-
-    def predict(self, frame, additional_faces=[]):
+    def predict(self, frame):
         """
         Perform face tracking on a single frame.
 
         Args:
             frame: Input image as numpy array (BGR format)
-            additional_faces: Optional list of additional face bounding boxes to track
 
         Returns:
             List of FaceInfo objects containing landmarks, 3D pose, gaze, and facial features
@@ -1134,152 +1038,104 @@ class Tracker():
         duration_model = 0.0
         duration_pnp = 0.0
 
-        new_faces = []
-        new_faces.extend(self.faces)
-        bonus_cutoff = len(self.faces)
-        new_faces.extend(additional_faces)
-        if self.use_retinaface > 0:
-            new_faces.extend(self.retinaface.get_results())
+        candidates = []
+        if self.face_bbox is not None:
+            candidates.append((self.face_bbox, 0.1))
+
         self.wait_count += 1
-        if self.detected == 0:
+        detection_bbox = None
+        if not self.detected or self.wait_count >= self.scan_every:
             start_fd = time.perf_counter()
-            if self.use_retinaface > 0:
-                retinaface_detections = self.retinaface.detect_retina(frame)
-                new_faces.extend(retinaface_detections)
-            else:
-                new_faces.extend(self.detect_faces(frame))
+            detection_bbox = self.detect_face(frame)
             duration_fd = 1000 * (time.perf_counter() - start_fd)
             self.wait_count = 0
-        elif self.detected < self.max_faces:
-            if self.wait_count >= self.scan_every:
-                if self.use_retinaface > 0:
-                    self.retinaface.background_detect(frame)
-                else:
-                    start_fd = time.perf_counter()
-                    new_faces.extend(self.detect_faces(frame))
-                    duration_fd = 1000 * (time.perf_counter() - start_fd)
-                    self.wait_count = 0
-        else:
-            self.wait_count = 0
+        if detection_bbox is not None:
+            candidates.append((detection_bbox, 0.0))
 
-        if len(new_faces) < 1:
-            duration = (time.perf_counter() - start) * 1000
-            if not self.silent:
-                print(f"Took {duration:.2f}ms")
-            return []
+        best_result = None
+        best_score = -np.inf
+        if candidates:
+            start_model = time.perf_counter()
+            for (x, y, w, h), bonus in candidates:
+                crop_x1 = x - int(w * 0.1)
+                crop_y1 = y - int(h * 0.125)
+                crop_x2 = x + w + int(w * 0.1)
+                crop_y2 = y + h + int(h * 0.125)
 
-        crops = []
-        crop_info = []
-        for j, (x,y,w,h) in enumerate(new_faces):
-            crop_x1 = x - int(w * 0.1)
-            crop_y1 = y - int(h * 0.125)
-            crop_x2 = x + w + int(w * 0.1)
-            crop_y2 = y + h + int(h * 0.125)
+                crop_x1, crop_y1 = clamp_to_im((crop_x1, crop_y1), self.width, self.height)
+                crop_x2, crop_y2 = clamp_to_im((crop_x2, crop_y2), self.width, self.height)
 
-            crop_x1, crop_y1 = clamp_to_im((crop_x1, crop_y1), self.width, self.height)
-            crop_x2, crop_y2 = clamp_to_im((crop_x2, crop_y2), self.width, self.height)
+                scale_x = float(crop_x2 - crop_x1) / self.res
+                scale_y = float(crop_y2 - crop_y1) / self.res
 
-            scale_x = float(crop_x2 - crop_x1) / self.res
-            scale_y = float(crop_y2 - crop_y1) / self.res
+                if crop_x2 - crop_x1 < 4 or crop_y2 - crop_y1 < 4:
+                    continue
 
-            if crop_x2 - crop_x1 < 4 or crop_y2 - crop_y1 < 4:
-                continue
-
-            start_pp = time.perf_counter()
-            crop = self.preprocess(im, (crop_x1, crop_y1, crop_x2, crop_y2))
-            duration_pp += 1000 * (time.perf_counter() - start_pp)
-            if crop is None:
-                continue
-            crops.append(crop)
-            crop_info.append((crop_x1, crop_y1, scale_x, scale_y, 0.0 if j >= bonus_cutoff else 0.1))
-        num_crops = len(crops)
-
-        start_model = time.perf_counter()
-        outputs = {}
-        for crop, info in zip(crops, crop_info):
-            result = self.landmark_pool.infer({self.input_name: crop})
-            output = result[0]
-            conf, lms = self.landmarks(output[0], info)
-            if conf > self.threshold:
+                start_pp = time.perf_counter()
+                crop = self.preprocess(im, (crop_x1, crop_y1, crop_x2, crop_y2))
+                duration_pp += 1000 * (time.perf_counter() - start_pp)
+                if crop is None:
+                    continue
+                info = (crop_x1, crop_y1, scale_x, scale_y, bonus)
+                result = self.landmark_pool.infer({self.input_name: crop})
+                output = result[0]
+                conf, lms = self.landmarks(output[0], info)
+                if conf <= self.threshold:
+                    continue
                 try:
                     eye_state = self.get_eye_state(frame, lms)
                 except Exception:
                     eye_state = [(1.0, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)]
-                outputs[info] = (conf, (lms, eye_state), 0)
+                score = conf + bonus
+                if score > best_score:
+                    best_score = score
+                    best_result = (conf, lms, eye_state)
+            duration_model = 1000 * (time.perf_counter() - start_model)
 
-        actual_faces = []
-        good_crops = []
-        for crop in crop_info:
-            if crop not in outputs:
-                continue
-            conf, lms, i = outputs[crop]
-            x1, y1, _ = lms[0].min(0)
-            x2, y2, _ = lms[0].max(0)
-            bb = (x1, y1, x2 - x1, y2 - y1)
-            outputs[crop] = (conf, lms, i, bb)
-            actual_faces.append(bb)
-            good_crops.append(crop)
-        groups = group_rects(actual_faces)
-
-        best_results = {}
-        for crop in good_crops:
-            conf, lms, i, bb = outputs[crop]
-            if conf < self.threshold:
-                continue;
-            group_id = groups[str(bb)][0]
-            if not group_id in best_results:
-                best_results[group_id] = [-1, [], 0]
-            if conf > self.threshold and best_results[group_id][0] < conf + crop[4]:
-                best_results[group_id][0] = conf + crop[4]
-                best_results[group_id][1] = lms
-                best_results[group_id][2] = crop[4]
-
-        sorted_results = sorted(best_results.values(), key=lambda x: x[0], reverse=True)[:self.max_faces]
-        self.assign_face_info(sorted_results)
-        duration_model = 1000 * (time.perf_counter() - start_model)
+        if best_result is not None:
+            conf, lms, eye_state = best_result
+            coord = np.array(lms)[:, 0:2].mean(0)
+            self.face_info.update((conf, (lms, eye_state)), coord, self.frame_count)
+        else:
+            self.face_info.update(None, None, self.frame_count)
 
         results = []
-        detected = []
-        start_pnp = time.perf_counter()
-        for face_info in self.face_info:
-            if face_info.alive and face_info.conf > self.threshold:
-                face_info.success, face_info.quaternion, face_info.euler, face_info.pnp_error, face_info.pts_3d, face_info.lms = self.estimate_depth(face_info)
-                face_info.adjust_3d()
-                lms = face_info.lms[:, 0:2]
-                x1, y1 = tuple(lms[0:66].min(0))
-                x2, y2 = tuple(lms[0:66].max(0))
-                bbox = (y1, x1, y2 - y1, x2 - x1)
-                face_info.bbox = bbox
-                detected.append(bbox)
-                results.append(face_info)
-        duration_pnp += 1000 * (time.perf_counter() - start_pnp)
+        if self.face_info.alive and self.face_info.conf > self.threshold:
+            start_pnp = time.perf_counter()
+            face_info = self.face_info
+            face_info.success, face_info.quaternion, face_info.euler, face_info.pnp_error, face_info.pts_3d, face_info.lms = self.estimate_depth(face_info)
+            face_info.adjust_3d()
+            lms = face_info.lms[:, 0:2]
+            x1, y1 = tuple(lms[0:66].min(0))
+            x2, y2 = tuple(lms[0:66].max(0))
+            bbox = (y1, x1, y2 - y1, x2 - x1)
+            face_info.bbox = bbox
+            results.append(face_info)
+            duration_pnp = 1000 * (time.perf_counter() - start_pnp)
 
-        if len(detected) > 0:
-            self.detected = len(detected)
-            self.faces = detected
+        if results:
+            self.detected = True
+            bbox = results[0].bbox
+            if bbox is not None and not np.isnan(np.array(bbox)).any():
+                self.face_bbox = bbox
+            else:
+                self.face_bbox = None
             self.discard = 0
         else:
-            self.detected = 0
+            self.detected = False
             self.discard += 1
             if self.discard > self.discard_after:
-                self.faces = []
-            else:
-                if self.bbox_growth > 0:
-                    faces = []
-                    for (x,y,w,h) in self.faces:
-                        x -= w * self.bbox_growth
-                        y -= h * self.bbox_growth
-                        w += 2 * w * self.bbox_growth
-                        h += 2 * h * self.bbox_growth
-                        faces.append((x,y,w,h))
-                    self.faces = faces
-        self.faces = [x for x in self.faces if not np.isnan(np.array(x)).any()]
-        self.detected = len(self.faces)
+                self.face_bbox = None
+            elif self.bbox_growth > 0 and self.face_bbox is not None:
+                x, y, w, h = self.face_bbox
+                x -= w * self.bbox_growth
+                y -= h * self.bbox_growth
+                w += 2 * w * self.bbox_growth
+                h += 2 * h * self.bbox_growth
+                self.face_bbox = (x, y, w, h)
 
         duration = (time.perf_counter() - start) * 1000
         if not self.silent:
             print(f"Took {duration:.2f}ms (detect: {duration_fd:.2f}ms, crop: {duration_pp:.2f}ms, track: {duration_model:.2f}ms, 3D points: {duration_pnp:.2f}ms)")
-
-        results = sorted(results, key=lambda x: x.id)
 
         return results

@@ -66,6 +66,16 @@ The heatmap regression based face detection model was trained on random 224x224 
 
 ## Algorithm
 
+### Model Layout
+
+The OpenVINO IR files shipped with this fork now live in dedicated subdirectories under `ov_models/`:
+
+* `ov_models/landmark-mobilenet-v3/landmark-mobilenet-v3.{xml,bin}` – 66‑point landmark head
+* `ov_models/headmap-detector-mobilenet-v3/headmap-detector-mobilenet-v3.{xml,bin}` – coarse heatmap detector
+* `ov_models/gaze-estimator-mobilenet-v3/gaze-estimator-mobilenet-v3.{xml,bin}` – per-eye gaze estimator
+
+You can replace these with your own fine‑tuned models as long as the paths and tensor shapes stay compatible.
+
 The algorithm is inspired by:
 
 * [Designing Neural Network Architectures for Different Applications: From Facial Landmark Tracking to Lane Departure Warning System](https://www.synopsys.com/designware-ip/technical-bulletin/ulsee-designing-neural-network.html) by YiTa Wu, Vice President of Engineering, ULSee
@@ -82,16 +92,7 @@ For all training a modified version of [Adaptive Wing Loss](https://github.com/t
 
 For expression detection, [LIBSVM](https://www.csie.ntu.edu.tw/~cjlin/libsvm/) is used.
 
-Face detection is done using a custom heatmap regression based face detection model or RetinaFace.
-
-    @inproceedings{deng2019retinaface,
-      title={RetinaFace: Single-stage Dense Face Localisation in the Wild},
-      author={Deng, Jiankang and Guo, Jia and Yuxiang, Zhou and Jinke Yu and Irene Kotsia and Zafeiriou, Stefanos},
-      booktitle={arxiv},
-      year={2019}
-    }
-
-RetinaFace detection is based on [this](https://github.com/biubug6/Pytorch_Retinaface) implementation. The pretrained model was modified to remove unnecessary landmark detection and converted to ONNX format for a resolution of 640x640.
+Face detection is done using a custom heatmap regression based face detection model.
 
 # Thanks!
 

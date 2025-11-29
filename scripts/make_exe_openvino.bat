@@ -27,15 +27,14 @@ if not exist "%VC_RUNTIME_DIR%\msvcp140.dll" (
 echo Building facetracker_openvino bundle
 pyinstaller facetracker.py --clean --onedir ^
     --name facetracker_openvino ^
-    --add-data ov-models;ov-models ^
+    --add-data ov_models;ov_models ^
     --add-binary "%OV_LIB_DIR%\*.dll";openvino\libs ^
-    --add-binary dshowcapture\*.dll;. ^
-    --add-binary escapi\*.dll;. ^
+    --add-binary cam_utils\dshowcapture\*.dll;cam_utils\dshowcapture ^
     --add-binary "%VC_RUNTIME_DIR%\msvcp140.dll";. ^
     --add-binary "%VC_RUNTIME_DIR%\vcomp140.dll";. ^
     --add-binary "%VC_RUNTIME_DIR%\concrt140.dll";. ^
     --add-binary "%VC_RUNTIME_DIR%\vccorlib140.dll";. ^
-    --add-binary run.bat;.
+    --add-binary scripts\run.bat;scripts
 if errorlevel 1 goto :error
 
 echo Done. Check dist\facetracker_openvino for the executable.

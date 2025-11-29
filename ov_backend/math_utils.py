@@ -47,54 +47,6 @@ def rotate_image(image, a, center):
     return rotated
 
 
-def intersects(r1, r2, amount=0.3):
-    area1 = r1[2] * r1[3]
-    area2 = r2[2] * r2[3]
-    inter = 0.0
-    total = area1 + area2
-
-    r1_x1, r1_y1, w, h = r1
-    r1_x2 = r1_x1 + w
-    r1_y2 = r1_y1 + h
-    r2_x1, r2_y1, w, h = r2
-    r2_x2 = r2_x1 + w
-    r2_y2 = r2_y1 + h
-
-    left = max(r1_x1, r2_x1)
-    right = min(r1_x2, r2_x2)
-    top = max(r1_y1, r2_y1)
-    bottom = min(r1_y2, r2_y2)
-    if left < right and top < bottom:
-        inter = (right - left) * (bottom - top)
-        total -= inter
-
-    if inter / total >= amount:
-        return True
-
-    return False
-
-
-def group_rects(rects):
-    rect_groups = {}
-    for rect in rects:
-        rect_groups[str(rect)] = [-1, -1, []]
-    group_id = 0
-    for i, rect in enumerate(rects):
-        name = str(rect)
-        group = group_id
-        group_id += 1
-        if rect_groups[name][0] < 0:
-            rect_groups[name] = [group, -1, []]
-        else:
-            group = rect_groups[name][0]
-        for j, other_rect in enumerate(rects):
-            if i == j:
-                continue
-            if intersects(rect, other_rect):
-                rect_groups[str(other_rect)] = [group, -1, []]
-    return rect_groups
-
-
 def logit(p, factor=16.0):
     if p >= 1.0:
         p = 0.9999999

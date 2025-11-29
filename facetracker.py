@@ -29,6 +29,8 @@ parser.add_argument("--max-feature-updates", type=int, help="This is the number 
 parser.add_argument("--no-3d-adapt", type=int, help="When set to 1, the 3D face model will not be adapted to increase the fit", default=1)
 parser.add_argument("--device", type=lambda s: s.upper(), help="Select OpenVINO device", default="GPU", choices=["CPU", "GPU", "NPU"])
 parser.add_argument("--model-dir", help="This can be used to specify the path to the directory containing the OpenVINO model files", default=None)
+parser.add_argument("--preproc-backend", help="Select preprocessing backend for detector/landmark/gaze models", default="opencv", choices=["opencv", "openvino"])
+parser.add_argument("--pin-cores", help="Comma-separated list of CPU core indices to pin the process to", default=None)
 if os.name == 'nt':
     parser.add_argument("--use-dshowcapture", type=int, help="When set to 1, libdshowcapture will be used for video input instead of OpenCV", default=1)
     parser.add_argument("--priority", type=int, help="When set, the process priority will be changed", default=None, choices=[0, 1, 2, 3, 4, 5])
@@ -36,10 +38,23 @@ args = parser.parse_args()
 
 os.environ["OMP_NUM_THREADS"] = str(args.max_threads)
 
-# Set CPU Priority
-if os.name == 'nt':
-    if args.priority is not None:
+GC_INTERVAL_SECONDS = 5.0
+
+# Set CPU Priority and CPU affinity
+psutil_process = None
+priority_value = getattr(args, "priority", None)
+pin_core_value = args.pin_cores
+if priority_value is not None or pin_core_value:
+    try:
         import psutil
+        psutil_process = psutil.Process(os.getpid())
+    except ImportError:
+        if args.silent == 0:
+            print("psutil is required for priority/affinity controls but is not installed.")
+        psutil_process = None
+
+if psutil_process is not None:
+    if priority_value is not None:
         PSUTIL_CLASSES = [
             psutil.IDLE_PRIORITY_CLASS, 
             psutil.BELOW_NORMAL_PRIORITY_CLASS, 
@@ -48,8 +63,16 @@ if os.name == 'nt':
             psutil.HIGH_PRIORITY_CLASS, 
             psutil.REALTIME_PRIORITY_CLASS
         ]
-        p = psutil.Process(os.getpid())
-        p.nice(PSUTIL_CLASSES[args.priority])
+        psutil_process.nice(PSUTIL_CLASSES[priority_value])
+
+    if pin_core_value:
+        try:
+            core_indices = [int(core.strip()) for core in pin_core_value.split(",") if core.strip() != ""]
+            if len(core_indices) > 0:
+                psutil_process.cpu_affinity(core_indices)
+        except Exception as e:
+            if args.silent == 0:
+                print(f"Failed to set CPU affinity ({e}). Proceeding without pinning.")
 
 def list_all_cameras(cap):
     info = cap.get_info()
@@ -83,7 +106,7 @@ def list_all_dcaps(cap, dcap_idx):
 
 # Display Camera or DCaps Devices
 if os.name == 'nt' and (args.list_cameras > 0 or args.list_dcaps is not None):
-    import dshowcapture
+    import cam_utils.dshowcapture as dshowcapture
     cap = dshowcapture.DShowCapture()
     if args.list_dcaps is not None:
         list_all_dcaps(cap, dcap_idx=args.list_dcaps)
@@ -95,10 +118,11 @@ if os.name == 'nt' and (args.list_cameras > 0 or args.list_dcaps is not None):
 import numpy as np
 import time
 import cv2
+cv2.setNumThreads(max(1, args.max_threads))
 import socket
 import struct
-from input_reader import InputReader, VideoReader, DShowCaptureReader, try_int
-from ovbackend.tracker import Tracker
+from cam_utils.input_reader import InputReader, VideoReader, DShowCaptureReader, try_int
+from ov_backend.tracker import Tracker
 
 target_ip = args.ip
 target_port = args.port
@@ -149,6 +173,7 @@ try:
     attempt = 0
     frame_time = time.perf_counter()
     target_duration = 0
+    last_gc_collect = frame_time
 
     if fps > 0:
         target_duration = 1. / float(fps)
@@ -213,16 +238,15 @@ try:
                 height,
                 threshold=args.threshold,
                 max_threads=args.max_threads,
-                max_faces=1,
                 discard_after=args.discard_after,
                 scan_every=args.scan_every,
                 silent=False if args.silent == 0 else True,
                 model_dir=args.model_dir,
                 detection_threshold=args.detection_threshold,
-                use_retinaface=0,
                 max_feature_updates=args.max_feature_updates,
                 static_model=True if args.no_3d_adapt == 1 else False,
-                device=args.device
+                device=args.device,
+                preproc_backend=args.preproc_backend
             )
 
         try:
@@ -344,20 +368,17 @@ try:
             if failures > 30:
                 break
 
-        collected = False
         del frame
 
-        duration = time.perf_counter() - frame_time
-        while duration < target_duration:
-            if not collected:
-                gc.collect()
-                collected = True
+        if target_duration > 0:
             duration = time.perf_counter() - frame_time
-            sleep_time = target_duration - duration
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            duration = time.perf_counter() - frame_time
+            if duration < target_duration:
+                time.sleep(target_duration - duration)
         frame_time = time.perf_counter()
+
+        if frame_time - last_gc_collect >= GC_INTERVAL_SECONDS:
+            gc.collect()
+            last_gc_collect = frame_time
 except KeyboardInterrupt:
     if args.silent == 0:
         print("Quitting")

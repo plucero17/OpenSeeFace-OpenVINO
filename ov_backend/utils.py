@@ -1,23 +1,30 @@
 import os
 from contextlib import contextmanager
+from pathlib import Path
 
 
 def _project_root():
-    return os.path.dirname(os.path.dirname(__file__))
+    return Path(__file__).resolve().parent.parent
 
 
 def resolve(path):
-    return os.path.join(_project_root(), path)
+    return str(_project_root() / path)
 
 
 def get_ov_model_base_path(model_dir):
-    model_base_path = resolve(os.path.join("ov-models"))
-    if model_dir is None:
-        if not os.path.exists(model_base_path):
-            model_base_path = resolve(os.path.join("..", "ov-models"))
-    else:
-        model_base_path = model_dir
-    return model_base_path
+    if model_dir is not None:
+        return model_dir
+
+    candidate_paths = [
+        resolve(os.path.join("ov_models")),
+        resolve(os.path.join("..", "ov_models")),
+        resolve(os.path.join("ov-models")),
+        resolve(os.path.join("..", "ov-models")),
+    ]
+    for path in candidate_paths:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError("Could not locate ov_models or legacy ov-models directory.")
 
 
 @contextmanager

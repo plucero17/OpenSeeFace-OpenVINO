@@ -35,30 +35,23 @@ class InferRequestPool:
     Simple pool of reusable infer requests to avoid reallocation overhead.
     """
 
-    def __init__(self, compiled_model, pool_size=2, tensor_wrapper=None):
+    def __init__(self, compiled_model, pool_size=2):
         self.compiled_model = compiled_model
         self.pool = queue.Queue()
-        self.tensor_wrapper = tensor_wrapper
         self.output_count = len(compiled_model.outputs)
         jobs = max(1, pool_size)
         for _ in range(jobs):
             self.pool.put(compiled_model.create_infer_request())
 
-    def _prepare_inputs(self, inputs):
-        if self.tensor_wrapper is None:
-            return inputs
-        if isinstance(inputs, dict):
-            return {key: self.tensor_wrapper(value) for key, value in inputs.items()}
-        if isinstance(inputs, (list, tuple)):
-            wrapped = [self.tensor_wrapper(value) for value in inputs]
-            return type(inputs)(wrapped)
-        return self.tensor_wrapper(inputs)
-
-    def infer(self, inputs):
+    def infer(self, feed_dict):
+        if not isinstance(feed_dict, dict):
+            raise ValueError("feed_dict must be a mapping of input_name -> ndarray")
         infer_request = self.pool.get()
         try:
-            prepared = self._prepare_inputs(inputs)
-            infer_request.infer(prepared)
+            for name, arr in feed_dict.items():
+                tensor = infer_request.get_tensor(name)
+                np.copyto(tensor.data, arr, casting="unsafe")
+            infer_request.infer()
             return [
                 np.array(infer_request.get_output_tensor(i).data, copy=True)
                 for i in range(self.output_count)

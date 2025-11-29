@@ -3,8 +3,7 @@ import sys
 import os
 import cv2
 import numpy as np
-import escapi
-import dshowcapture
+from . import dshowcapture
 import time
 import traceback
 import gc
@@ -27,31 +26,6 @@ class VideoReader():
         return self.cap.read()
     def close(self):
         self.cap.release()
-
-class EscapiReader(VideoReader):
-    def __init__(self, capture, width, height, fps):
-        self.device = None
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.device = capture
-        escapi.count_capture_devices()
-        self.name = str(escapi.device_name(self.device).decode('utf8', 'surrogateescape'))
-        self.buffer = escapi.init_camera(self.device, self.width, self.height, self.fps)
-        escapi.do_capture(self.device)
-    def is_open(self):
-        return True
-    def is_ready(self):
-        return escapi.is_capture_done(self.device)
-    def read(self):
-        if escapi.is_capture_done(self.device):
-            image = escapi.read(self.device, self.width, self.height, self.buffer)
-            escapi.do_capture(self.device)
-            return True, image
-        else:
-            return False, None
-    def close(self):
-        escapi.deinit_camera(self.device)
 
 class DShowCaptureReader(VideoReader):
     def __init__(self, capture, width, height, fps, use_dshowcapture=True, dcap=None):
@@ -160,48 +134,19 @@ class InputReader():
                 self.reader = VideoReader(capture)
             elif capture == str(try_int(capture)):
                 if os.name == 'nt':
-                    # Try with DShowCapture
-                    good = True
-                    name = ""
-                    try:
-                        if use_dshowcapture:
+                    # Try with DShowCapture first
+                    if use_dshowcapture:
+                        try:
                             self.reader = DShowCaptureReader(int(capture), width, height, fps, dcap=dcap)
-                            name = self.reader.name
-                            good = test_reader(self.reader)
-                            self.name = name
-                        else:
-                            good = False
-                    except Exception:
-                        print("DShowCapture exception: ")
-                        traceback.print_exc()
-                        good = False
-                    if good:
-                        return
-                    # Try with Escapi
-                    good = True
-                    try:
-                        print(f"DShowCapture failed. Falling back to escapi for device {name}.", file=sys.stderr)
-                        escapi.init()
-                        devices = escapi.count_capture_devices()
-                        found = None
-                        for i in range(devices):
-                            escapi_name = str(escapi.device_name(i).decode('utf8', 'surrogateescape'))
-                            if name == escapi_name:
-                                found = i
-                        if found is None:
-                            good = False
-                        else:
-                            print(f"Found device {name} as {i}.", file=sys.stderr)
-                            self.reader = EscapiReader(found, width, height, fps)
-                            good = test_reader(self.reader)
-                    except Exception:
-                        print("Escapi exception: ")
-                        traceback.print_exc()
-                        good = False
-                    if good:
-                        return
-                    # Try with OpenCV
-                    print(f"Escapi failed. Falling back to OpenCV. If this fails, please change your camera settings.", file=sys.stderr)
+                            self.name = self.reader.name
+                            if test_reader(self.reader):
+                                return
+                        except Exception:
+                            print("DShowCapture exception: ")
+                            traceback.print_exc()
+                            self.reader = None
+                    # Fall back to OpenCV
+                    print("DShowCapture failed. Falling back to OpenCV. If this fails, please change your camera settings.", file=sys.stderr)
                     self.reader = OpenCVReader(int(capture), width, height, fps)
                     self.name = self.reader.name
                 else:
